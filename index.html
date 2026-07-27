@@ -2666,11 +2666,15 @@ async function connectFirebase() {
       if(snapshot.val() === true) {
         showFirebaseStatus('✓ Connected!', false);
         if(!firebaseInitialized) {
-          // First successful connection this session: run full startup once.
+          // First successful connection this session. The app itself was
+          // already shown from local data at startup (see bottom of file),
+          // so all we do here is dismiss the connect overlay and attach
+          // live sync — never re-run init() / block the app on this.
           setTimeout(() => {
             firebaseInitialized = true;
             document.getElementById('firebaseConfigScreen').style.display = 'none';
-            initApp();
+            setupFirebaseRealtimeSync(); // pulls in any newer cloud data automatically
+            setSaveStatus(true, "🔥 Firebase sync ✓");
           }, 500);
         } else {
           // We've already initialized once. On later reconnects (wifi drop,
@@ -2704,21 +2708,24 @@ function checkFirebaseConnection() {
 
 // Override storage functions to use Firebase
 async function storageGetSafe() {
-  if(!firebaseDb) return null;
-  try {
-    const snapshot = await firebaseDb.ref('ancy-deskhub-data').get();
-    if(snapshot.exists()) {
-      const data = snapshot.val();
-      if(data && typeof data === 'string') {
-        return data;
-      } else if(data && typeof data === 'object') {
-        return JSON.stringify(data);
+  if(firebaseDb) {
+    try {
+      const snapshot = await firebaseDb.ref('ancy-deskhub-data').get();
+      if(snapshot.exists()) {
+        const data = snapshot.val();
+        if(data && typeof data === 'string') {
+          return data;
+        } else if(data && typeof data === 'object') {
+          return JSON.stringify(data);
+        }
       }
+    } catch(e) {
+      console.error('Firebase read failed:', e);
     }
-  } catch(e) {
-    console.error('Firebase read failed:', e);
   }
-  // Fallback to local storage
+  // Fallback to local storage — also used when Firebase hasn't connected
+  // yet (e.g. still reconnecting after the app was closed for a while),
+  // so the app is never left with nothing to show.
   try { return window.localStorage.getItem(STORAGE_KEY); }catch(e){}
   return null;
 }
@@ -2904,8 +2911,26 @@ async function init(){
   }
 }
 
-// Check Firebase on startup
-checkFirebaseConnection();
+/* ================= STARTUP =================
+   The app must always come up from THIS device's own saved data the
+   instant the page opens — Firebase is a live-sync enhancement layered
+   on top afterwards, never a gate the app can get stuck behind. */
+init();                     // render immediately from local/IndexedDB copy
+checkFirebaseConnection();  // connect to Firebase in the background
+
+// Safety net: if Firebase hasn't finished connecting within a few
+// seconds (offline, slow reconnect after being closed a while, expired
+// database rules, blocked network, etc.), stop blocking the app behind
+// the connect overlay. Local data is already showing; live sync will
+// still attach silently the moment Firebase does connect.
+setTimeout(() => {
+  if(!firebaseInitialized){
+    const scr = document.getElementById('firebaseConfigScreen');
+    if(scr) scr.style.display = 'none';
+    setSaveStatus(true, "Saved on this device (offline)");
+    toast("⚠️ Couldn't reach Firebase — working offline. Will sync once reconnected.");
+  }
+}, 6000);
 </script>
 </body>
 </html>
