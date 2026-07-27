@@ -1127,13 +1127,17 @@ async function loadState(){
 let saveTimer = null;
 function saveState(immediate){
   clearTimeout(saveTimer);
+  // Remember what version this edit was based on, BEFORE we stamp a new
+  // timestamp — needed to detect if someone else saved something newer
+  // in between (see storageSetSafe's conflict check).
+  const baseUpdatedAt = lastSeenRemoteUpdatedAt;
   // Stamp the moment this device changed the data. Other devices polling
   // the cloud copy use this to detect that something new has arrived.
   STATE.updatedAt = Date.now();
   STATE.lastEditedBy = CLIENT_ID;
-  lastSeenRemoteUpdatedAt = STATE.updatedAt;
   const doSave = async () => {
-    const ok = await storageSetSafe(JSON.stringify(STATE));
+    const ok = await storageSetSafe(JSON.stringify(STATE), baseUpdatedAt);
+    if(ok) lastSeenRemoteUpdatedAt = STATE.updatedAt;
     setSaveStatus(ok, ok ? (hasCloudStorage() ? "Synced" : "Saved") : "Not saved on this device");
     if(!ok) toast("⚠️ Could not save — data may not persist on this device");
   };
@@ -2661,11 +2665,23 @@ async function connectFirebase() {
     firebaseDb.ref('.info/connected').on('value', (snapshot) => {
       if(snapshot.val() === true) {
         showFirebaseStatus('✓ Connected!', false);
-        setTimeout(() => {
-          firebaseInitialized = true;
-          document.getElementById('firebaseConfigScreen').style.display = 'none';
-          initApp();
-        }, 500);
+        if(!firebaseInitialized) {
+          // First successful connection this session: run full startup once.
+          setTimeout(() => {
+            firebaseInitialized = true;
+            document.getElementById('firebaseConfigScreen').style.display = 'none';
+            initApp();
+          }, 500);
+        } else {
+          // We've already initialized once. On later reconnects (wifi drop,
+          // tab backgrounded, etc.) do NOT re-run initApp() again — that
+          // would register a second, third, fourth... live-sync listener
+          // stacked on top of the existing one, which can race and cause
+          // saves to clobber each other. The already-registered listener
+          // will automatically receive the current cloud data the moment
+          // the connection is restored, so we just let it do its job.
+          toast('✓ Back online — syncing latest data...');
+        }
       } else {
         showFirebaseStatus('Connection lost', true);
         document.getElementById('firebaseConnectBtn').disabled = false;
@@ -2707,17 +2723,51 @@ async function storageGetSafe() {
   return null;
 }
 
-async function storageSetSafe(valueStr) {
+async function storageSetSafe(valueStr, baseUpdatedAt) {
   let savedOk = false;
+  let conflict = false;
   
   // Save to Firebase
   if(firebaseDb) {
     try {
-      await firebaseDb.ref('ancy-deskhub-data').set(valueStr);
-      savedOk = true;
+      // Use a transaction instead of a blind .set() — this lets us check
+      // what's actually on the server right before we write, and refuse to
+      // stomp on it if someone else saved something newer that we haven't
+      // pulled in yet (e.g. this device was offline and just reconnected).
+      const result = await firebaseDb.ref('ancy-deskhub-data').transaction((currentRaw) => {
+        if(currentRaw != null && baseUpdatedAt !== undefined){
+          try {
+            const current = typeof currentRaw === 'string' ? JSON.parse(currentRaw) : currentRaw;
+            const currentUpdatedAt = (current && current.updatedAt) || 0;
+            if(current && current.lastEditedBy !== CLIENT_ID && currentUpdatedAt > baseUpdatedAt){
+              // Someone else saved something we haven't seen yet — abort
+              // this write (return undefined) rather than overwrite it.
+              return;
+            }
+          } catch(e) { /* if we can't parse it, fall through and write */ }
+        }
+        return valueStr;
+      });
+      if(result && result.committed) {
+        savedOk = true;
+      } else {
+        conflict = true;
+      }
     } catch(e) {
       console.error('Firebase write failed:', e);
     }
+  }
+  
+  if(conflict) {
+    // Pull the newer data in immediately so the user doesn't lose track of
+    // what actually happened, and let them know to redo their last action.
+    toast('⚠️ Someone else just saved changes — reloading the latest data. Please redo your last action.');
+    try {
+      await loadState();
+      try { window.localStorage.setItem(STORAGE_KEY, JSON.stringify(STATE)); window.localStorage.setItem(STORAGE_KEY_BACKUP, JSON.stringify(STATE)); } catch(e){}
+      populateSelects(); computeTotal(); if(typeof renderBoard === 'function') renderBoard();
+    } catch(e){}
+    return false;
   }
   
   // Also save to localStorage as backup
@@ -2733,8 +2783,11 @@ async function storageSetSafe(valueStr) {
 }
 
 // Set up real-time Firebase listeners
+let realtimeSyncAttached = false;
 function setupFirebaseRealtimeSync() {
   if(!firebaseDb) return;
+  if(realtimeSyncAttached) return; // never stack a second live listener
+  realtimeSyncAttached = true;
   
   firebaseDb.ref('ancy-deskhub-data').on('value', (snapshot) => {
     if(!snapshot.exists()) return;
